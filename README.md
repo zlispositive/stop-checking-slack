@@ -42,14 +42,31 @@ Click the 💬 menu bar item for details, to reset today's count, or to quit.
 > permission, so first launch should not prompt. If macOS ever does, grant it
 > under System Settings → Privacy & Security.
 
-## Start automatically at login (optional)
+## Start automatically at login
 
-1. Run `setup.command` once (creates the `.venv`).
-2. System Settings → General → Login Items → **+** → add
-   **`start_at_login.command`** from this folder.
+Double-click **`install_autostart.command`**. It installs a per-user
+LaunchAgent (`~/Library/LaunchAgents/com.lingzhang.slack-check-tracker.plist`)
+that:
 
-`start_at_login.command` runs the app from the project's virtualenv, so it
-does not depend on which `python3` is on your PATH.
+- starts the tracker at every login,
+- relaunches it if it ever crashes,
+- but stays down when you Quit it from the menu (a clean exit is respected).
+
+Re-running the installer is safe — it stops any existing copy first, so you
+never end up with two menu bar icons. Re-run it if you move the project folder;
+it rewrites the paths.
+
+To turn it off, double-click **`uninstall_autostart.command`** (unloads the
+agent, removes the plist, and quits the running app).
+
+Logs go to `~/Library/Logs/slack-check-tracker.log`.
+
+### Lightweight alternative (Login Items)
+
+If you'd rather not use a LaunchAgent: run `setup.command` once, then add
+**`start_at_login.command`** under System Settings → General → Login Items.
+It runs the app from the project's virtualenv, so it doesn't depend on which
+`python3` is on your PATH. (No crash-relaunch with this method.)
 
 ## Tuning
 
