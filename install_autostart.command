@@ -10,7 +10,7 @@
 set -e
 cd "$(dirname "$0")"
 
-LABEL="com.lingzhang.slack-check-tracker"
+LABEL="com.stop-checking-slack.tracker"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 PROJECT_DIR="$(pwd)"
 VENV_PY="$PROJECT_DIR/.venv/bin/python"

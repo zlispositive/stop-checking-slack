@@ -4,7 +4,7 @@
 set -e
 cd "$(dirname "$0")"
 
-LABEL="com.lingzhang.slack-check-tracker"
+LABEL="com.stop-checking-slack.tracker"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 UID_NUM="$(id -u)"
 

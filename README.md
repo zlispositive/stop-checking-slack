@@ -45,7 +45,7 @@ Click the 💬 menu bar item for details, to reset today's count, or to quit.
 ## Start automatically at login
 
 Double-click **`install_autostart.command`**. It installs a per-user
-LaunchAgent (`~/Library/LaunchAgents/com.lingzhang.slack-check-tracker.plist`)
+LaunchAgent (`~/Library/LaunchAgents/com.stop-checking-slack.tracker.plist`)
 that:
 
 - starts the tracker at every login,
