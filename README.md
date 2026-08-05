@@ -36,6 +36,8 @@ The `ledger` table records:
 
 - `status` entries immediately when you switch between working, excluded apps,
   idle, sleep, unavailable input, or tracker shutdown;
+- `slack_check` entries whenever Slack becomes frontmost, including
+  `trigger = frontmost_app_transition` and the `previous_app`;
 - `duration` entries with the local date, start/end timestamps, app, status,
   reason, and elapsed seconds.
 

@@ -157,6 +157,7 @@ class SlackCheckTracker(rumps.App):
         # Tracks whether Slack was frontmost on the previous poll, so we only
         # count the *transition* into Slack rather than every poll while it's open.
         self.slack_was_frontmost = False
+        self.previous_frontmost_name = None
 
         self._load_state()
 
@@ -167,6 +168,7 @@ class SlackCheckTracker(rumps.App):
         self.slack_was_frontmost = self._is_slack_app(
             frontmost_bundle, frontmost_name
         )
+        self.previous_frontmost_name = frontmost_name
 
         # Menu items (the title line is the menu bar; these are the dropdown).
         self.work_detail_item = rumps.MenuItem("Work tracked: —")
@@ -429,7 +431,9 @@ class SlackCheckTracker(rumps.App):
                 duration_seconds REAL,
                 observed_started_at TEXT,
                 observed_ended_at TEXT,
-                clock_adjustment_seconds REAL
+                clock_adjustment_seconds REAL,
+                trigger TEXT,
+                previous_app TEXT
             );
             CREATE INDEX IF NOT EXISTS ledger_date_status
                 ON ledger(date, status, app);
@@ -442,6 +446,8 @@ class SlackCheckTracker(rumps.App):
             "observed_started_at": "TEXT",
             "observed_ended_at": "TEXT",
             "clock_adjustment_seconds": "REAL",
+            "trigger": "TEXT",
+            "previous_app": "TEXT",
         }
         for column, declaration in migration_columns.items():
             if column not in existing_columns:
@@ -468,12 +474,12 @@ class SlackCheckTracker(rumps.App):
                         record_id, type, date, timestamp, started_at, ended_at,
                         status, app, reason, duration_seconds,
                         observed_started_at, observed_ended_at,
-                        clock_adjustment_seconds
+                        clock_adjustment_seconds, trigger, previous_app
                     ) VALUES (
                         :record_id, :type, :date, :timestamp, :started_at,
                         :ended_at, :status, :app, :reason, :duration_seconds,
                         :observed_started_at, :observed_ended_at,
-                        :clock_adjustment_seconds
+                        :clock_adjustment_seconds, :trigger, :previous_app
                     )
                     """,
                     self._pending_ledger_records,
@@ -501,7 +507,11 @@ class SlackCheckTracker(rumps.App):
             return None
         record = dict(record)
         if (
-            record.get("type") not in {"status", "duration"}
+            record.get("type") not in {
+                "status",
+                "duration",
+                "slack_check",
+            }
             or not isinstance(record.get("date"), str)
             or not isinstance(record.get("status"), str)
         ):
@@ -514,6 +524,8 @@ class SlackCheckTracker(rumps.App):
         record.setdefault("observed_started_at", None)
         record.setdefault("observed_ended_at", None)
         record.setdefault("clock_adjustment_seconds", None)
+        record.setdefault("trigger", None)
+        record.setdefault("previous_app", None)
         record.setdefault("app", None)
         record.setdefault("reason", None)
         return record
@@ -759,7 +771,24 @@ class SlackCheckTracker(rumps.App):
             self.count_today += 1
             self.last_check_ts = time.time()
             self._save_state()
+            self._queue_ledger_records(
+                [
+                    {
+                        "type": "slack_check",
+                        "timestamp": self._iso_timestamp(self.last_check_ts),
+                        "date": date.fromtimestamp(
+                            self.last_check_ts
+                        ).isoformat(),
+                        "status": "checked",
+                        "app": frontmost_name or SLACK_APP_NAME,
+                        "reason": "Slack became the frontmost app",
+                        "trigger": "frontmost_app_transition",
+                        "previous_app": self.previous_frontmost_name,
+                    }
+                ]
+            )
         self.slack_was_frontmost = is_front
+        self.previous_frontmost_name = frontmost_name
 
         self._sync_work_tracking(frontmost_bundle, frontmost_name)
         now_monotonic = time.monotonic()

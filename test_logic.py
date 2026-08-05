@@ -174,7 +174,7 @@ def read_ledger_records():
             SELECT record_id, type, date, timestamp, started_at, ended_at,
                    status, app, reason, duration_seconds,
                    observed_started_at, observed_ended_at,
-                   clock_adjustment_seconds
+                   clock_adjustment_seconds, trigger, previous_app
             FROM ledger
             ORDER BY rowid
             """
@@ -204,6 +204,17 @@ app.tick(None)
 set_front("slack")
 app.tick(None)
 check("leave and re-enter counts again", app.count_today == 2)
+slack_check_records = [
+    record for record in read_ledger_records()
+    if record["type"] == "slack_check"
+]
+check("Slack checks record their trigger and previous app",
+      [(record["trigger"], record["previous_app"])
+       for record in slack_check_records]
+      == [
+          ("frontmost_app_transition", "Safari"),
+          ("frontmost_app_transition", "Safari"),
+      ])
 
 # --- Test 2: the phantom-count fix — launch while Slack IS frontmost
 reset_state()
@@ -744,6 +755,8 @@ try:
                 "observed_started_at",
                 "observed_ended_at",
                 "clock_adjustment_seconds",
+                "trigger",
+                "previous_app",
             }
         }
         for record in pending_records
