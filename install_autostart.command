@@ -28,6 +28,16 @@ launchctl bootout "gui/$UID_NUM/$LABEL" 2>/dev/null || true
 # Match on the script filename, not the full path: a copy started with a
 # relative path (e.g. from setup.command) won't match an absolute pattern.
 pkill -f "slack_check_tracker.py" 2>/dev/null || true
+for _ in {1..100}; do
+  if ! pgrep -f "[s]lack_check_tracker.py" >/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
+if pgrep -f "[s]lack_check_tracker.py" >/dev/null; then
+  echo "Could not stop the existing tracker process." >&2
+  exit 1
+fi
 
 echo "==> Writing LaunchAgent: $PLIST"
 mkdir -p "$HOME/Library/LaunchAgents"

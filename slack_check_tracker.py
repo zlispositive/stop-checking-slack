@@ -23,15 +23,19 @@ Requires: macOS, Python 3, and the `rumps` and `pyobjc` packages.
 (See setup.command / README for the recommended virtualenv install.)
 """
 
+import ctypes
+import fcntl
 import json
 import math
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
-from datetime import datetime, date
+import uuid
+from datetime import datetime, date, timedelta
 
 import rumps
 
@@ -40,6 +44,14 @@ from AppKit import NSWorkspace
 
 
 STATE_PATH = os.path.expanduser("~/.slack_check_tracker.json")
+LEDGER_PATH = os.path.expanduser("~/.slack_check_tracker_ledger.sqlite3")
+LEDGER_SPOOL_PATH = os.path.expanduser(
+    "~/.slack_check_tracker_ledger.pending.json"
+)
+INSTANCE_LOCK_PATH = os.path.expanduser("~/.slack_check_tracker.lock")
+ENABLE_INSTANCE_LOCK = True
+INSTANCE_LOCK_WAIT_SECONDS = 5
+INSTANCE_LOCK_RETRY_INTERVAL = 0.1
 STATUS_ITEM_AUTOSAVE_NAME = "com.stop-checking-slack.tracker.primary"
 
 # How often (seconds) we poll the frontmost app and refresh the title.
@@ -48,6 +60,7 @@ INPUT_PROBE_INTERVAL = 5
 INPUT_PROBE_TIMEOUT = 0.25
 INPUT_IDLE_THRESHOLD = 60
 STATE_SAVE_INTERVAL = 60
+CLOCK_ADJUSTMENT_TOLERANCE = 2
 
 # Work time accumulates automatically only while one of these apps is
 # frontmost and keyboard/mouse input was seen recently.
@@ -87,11 +100,37 @@ def _read_input_idle_seconds():
     return int(match.group(1)) / 1_000_000_000
 
 
+def _read_continuous_time():
+    """Read a monotonic macOS clock that continues advancing during sleep."""
+    if sys.platform != "darwin":
+        return None
+
+    class MachTimebaseInfo(ctypes.Structure):
+        _fields_ = [
+            ("numer", ctypes.c_uint32),
+            ("denom", ctypes.c_uint32),
+        ]
+
+    try:
+        system = ctypes.CDLL(None)
+        system.mach_continuous_time.restype = ctypes.c_uint64
+        info = MachTimebaseInfo()
+        if system.mach_timebase_info(ctypes.byref(info)) != 0 or not info.denom:
+            return None
+        ticks = system.mach_continuous_time()
+        return ticks * info.numer / info.denom / 1_000_000_000
+    except (AttributeError, OSError):
+        return None
+
+
 class SlackCheckTracker(rumps.App):
     def __init__(self):
         # Keep the original rumps app name so existing Application Support
         # state is reused; the visible status-bar title is set separately.
         super().__init__("💬 —", title="🪑—  💬—·0×", quit_button=None)
+        self._instance_lock = None
+        if ENABLE_INSTANCE_LOCK:
+            self._acquire_instance_lock()
 
         # In-memory state, seeded from disk.
         self.count_today = 0
@@ -106,6 +145,15 @@ class SlackCheckTracker(rumps.App):
         self._cached_input_idle_seconds = None
         self._last_state_save_monotonic = time.monotonic()
         self.state_save_error = False
+        self.ledger_status = None
+        self.ledger_app = None
+        self.ledger_reason = None
+        self.ledger_started_ts = None
+        self.ledger_started_monotonic = None
+        self.ledger_started_continuous = None
+        self.ledger_save_error = False
+        self.ledger_clock_warning = False
+        self._pending_ledger_records = []
         # Tracks whether Slack was frontmost on the previous poll, so we only
         # count the *transition* into Slack rather than every poll while it's open.
         self.slack_was_frontmost = False
@@ -125,11 +173,15 @@ class SlackCheckTracker(rumps.App):
         self.work_rule_item = rumps.MenuItem(
             "Auto: VS Code or cmux + recent keyboard/mouse input"
         )
+        self.ledger_item = rumps.MenuItem(
+            "Ledger: ~/.slack_check_tracker_ledger.sqlite3"
+        )
         self.detail_item = rumps.MenuItem("Last checked: —")
         self.count_item = rumps.MenuItem("Checks today: 0")
         self.menu = [
             self.work_detail_item,
             self.work_rule_item,
+            self.ledger_item,
             rumps.MenuItem("Reset work session", callback=self.reset_work_session),
             None,
             self.detail_item,
@@ -144,12 +196,35 @@ class SlackCheckTracker(rumps.App):
         self._timer = rumps.Timer(self.tick, POLL_INTERVAL)
         self._timer.start()
 
+        self._load_ledger_spool()
+
         # Start counting immediately if launch occurs in an eligible app with
         # recent user input; otherwise wait for the first eligible tick.
         self._sync_work_tracking(frontmost_bundle, frontmost_name)
 
         # Render once immediately so we don't show a placeholder for 2s.
         self._refresh_title()
+
+    def _acquire_instance_lock(self):
+        self._instance_lock = open(INSTANCE_LOCK_PATH, "a+")
+        deadline = time.monotonic() + INSTANCE_LOCK_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(
+                    self._instance_lock.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+                return
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    print(
+                        "Another tracker instance is already running.",
+                        file=sys.stderr,
+                    )
+                    self._instance_lock.close()
+                    self._instance_lock = None
+                    raise SystemExit(0)
+                time.sleep(INSTANCE_LOCK_RETRY_INTERVAL)
 
     def run(self, **options):
         # rumps creates the NSStatusItem immediately before before_start. Set an
@@ -160,7 +235,8 @@ class SlackCheckTracker(rumps.App):
         callbacks = (
             (rumps.events.before_start, self._configure_status_item),
             (rumps.events.on_sleep, self._handle_sleep),
-            (rumps.events.before_quit, self._pause_work_session),
+            (rumps.events.on_wake, self._handle_wake),
+            (rumps.events.before_quit, self._handle_quit),
         )
         previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
         signal.signal(signal.SIGTERM, self._handle_sigterm)
@@ -224,6 +300,333 @@ class SlackCheckTracker(rumps.App):
         except OSError as error:
             self.state_save_error = True
             print(f"Could not save tracker state: {error}", file=sys.stderr)
+
+    # ---- status ledger -----------------------------------------------
+
+    @staticmethod
+    def _iso_timestamp(timestamp):
+        return datetime.fromtimestamp(timestamp).astimezone().isoformat(
+            timespec="seconds"
+        )
+
+    def _duration_records(
+        self,
+        started_ts,
+        ended_ts,
+        status,
+        app_name,
+        reason,
+        elapsed_seconds=None,
+    ):
+        if elapsed_seconds is None:
+            elapsed_seconds = max(0.0, ended_ts - started_ts)
+        elapsed_seconds = max(0.0, elapsed_seconds)
+        if elapsed_seconds == 0:
+            return []
+
+        clock_adjustment = ended_ts - started_ts - elapsed_seconds
+        clock_was_adjusted = (
+            abs(clock_adjustment) > CLOCK_ADJUSTMENT_TOLERANCE
+        )
+        accounting_end_ts = (
+            started_ts + elapsed_seconds if clock_was_adjusted else ended_ts
+        )
+        records = []
+        cursor = started_ts
+        accounting_seconds = accounting_end_ts - started_ts
+        remaining_elapsed = round(elapsed_seconds, 3)
+        while cursor < accounting_end_ts:
+            segment_day = date.fromtimestamp(cursor)
+            next_midnight = datetime.combine(
+                segment_day + timedelta(days=1), datetime.min.time()
+            ).timestamp()
+            segment_end = min(accounting_end_ts, next_midnight)
+            if segment_end == accounting_end_ts:
+                segment_elapsed = remaining_elapsed
+            else:
+                wall_fraction = (
+                    segment_end - cursor
+                ) / accounting_seconds
+                segment_elapsed = round(elapsed_seconds * wall_fraction, 3)
+                remaining_elapsed = round(
+                    max(0.0, remaining_elapsed - segment_elapsed),
+                    3,
+                )
+            records.append(
+                {
+                    "type": "duration",
+                    "date": segment_day.isoformat(),
+                    "started_at": self._iso_timestamp(cursor),
+                    "ended_at": self._iso_timestamp(segment_end),
+                    "observed_started_at": self._iso_timestamp(started_ts),
+                    "observed_ended_at": self._iso_timestamp(ended_ts),
+                    "clock_adjustment_seconds": (
+                        round(clock_adjustment, 3)
+                        if clock_was_adjusted
+                        else 0.0
+                    ),
+                    "status": status,
+                    "app": app_name,
+                    "reason": reason,
+                    "duration_seconds": segment_elapsed,
+                }
+            )
+            cursor = segment_end
+        return records
+
+    def _load_ledger_spool(self):
+        try:
+            with open(LEDGER_SPOOL_PATH, "r") as spool:
+                records = json.load(spool)
+            if isinstance(records, list):
+                for record in records:
+                    normalized = self._normalize_ledger_record(record)
+                    if normalized is None:
+                        self.ledger_save_error = True
+                        print(
+                            "Ignored malformed tracker ledger spool record.",
+                            file=sys.stderr,
+                        )
+                        continue
+                    self._pending_ledger_records.append(normalized)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return
+        self._flush_ledger_records()
+
+    def _persist_ledger_spool(self):
+        tmp = LEDGER_SPOOL_PATH + ".tmp"
+        with open(tmp, "w") as spool:
+            json.dump(self._pending_ledger_records, spool, sort_keys=True)
+            spool.flush()
+            os.fsync(spool.fileno())
+        os.replace(tmp, LEDGER_SPOOL_PATH)
+        self._fsync_parent_directory(LEDGER_SPOOL_PATH)
+
+    @staticmethod
+    def _fsync_parent_directory(path):
+        parent = os.path.dirname(path) or "."
+        directory = os.open(parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+    @staticmethod
+    def _initialize_ledger_database(connection):
+        connection.executescript(
+            """
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS ledger (
+                record_id TEXT PRIMARY KEY,
+                type TEXT NOT NULL,
+                date TEXT NOT NULL,
+                timestamp TEXT,
+                started_at TEXT,
+                ended_at TEXT,
+                status TEXT NOT NULL,
+                app TEXT,
+                reason TEXT,
+                duration_seconds REAL,
+                observed_started_at TEXT,
+                observed_ended_at TEXT,
+                clock_adjustment_seconds REAL
+            );
+            CREATE INDEX IF NOT EXISTS ledger_date_status
+                ON ledger(date, status, app);
+            """
+        )
+        existing_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(ledger)")
+        }
+        migration_columns = {
+            "observed_started_at": "TEXT",
+            "observed_ended_at": "TEXT",
+            "clock_adjustment_seconds": "REAL",
+        }
+        for column, declaration in migration_columns.items():
+            if column not in existing_columns:
+                connection.execute(
+                    f"ALTER TABLE ledger ADD COLUMN {column} {declaration}"
+                )
+
+    def _flush_ledger_records(self):
+        if not self._pending_ledger_records:
+            return
+
+        try:
+            self._persist_ledger_spool()
+        except OSError as error:
+            self.ledger_save_error = True
+            print(f"Could not persist tracker ledger spool: {error}", file=sys.stderr)
+
+        try:
+            with sqlite3.connect(LEDGER_PATH, timeout=1) as connection:
+                self._initialize_ledger_database(connection)
+                connection.executemany(
+                    """
+                    INSERT OR IGNORE INTO ledger (
+                        record_id, type, date, timestamp, started_at, ended_at,
+                        status, app, reason, duration_seconds,
+                        observed_started_at, observed_ended_at,
+                        clock_adjustment_seconds
+                    ) VALUES (
+                        :record_id, :type, :date, :timestamp, :started_at,
+                        :ended_at, :status, :app, :reason, :duration_seconds,
+                        :observed_started_at, :observed_ended_at,
+                        :clock_adjustment_seconds
+                    )
+                    """,
+                    self._pending_ledger_records,
+                )
+            self._pending_ledger_records.clear()
+            self.ledger_save_error = False
+            try:
+                os.remove(LEDGER_SPOOL_PATH)
+                self._fsync_parent_directory(LEDGER_SPOOL_PATH)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                # A stale spool is safe: record IDs make replay idempotent.
+                print(
+                    f"Could not remove tracker ledger spool: {error}",
+                    file=sys.stderr,
+                )
+        except (OSError, sqlite3.Error) as error:
+            self.ledger_save_error = True
+            print(f"Could not update tracker ledger: {error}", file=sys.stderr)
+
+    @staticmethod
+    def _normalize_ledger_record(record):
+        if not isinstance(record, dict):
+            return None
+        record = dict(record)
+        if (
+            record.get("type") not in {"status", "duration"}
+            or not isinstance(record.get("date"), str)
+            or not isinstance(record.get("status"), str)
+        ):
+            return None
+        record.setdefault("record_id", uuid.uuid4().hex)
+        record.setdefault("timestamp", None)
+        record.setdefault("started_at", None)
+        record.setdefault("ended_at", None)
+        record.setdefault("duration_seconds", None)
+        record.setdefault("observed_started_at", None)
+        record.setdefault("observed_ended_at", None)
+        record.setdefault("clock_adjustment_seconds", None)
+        record.setdefault("app", None)
+        record.setdefault("reason", None)
+        return record
+
+    def _queue_ledger_records(self, records):
+        for record in records:
+            normalized = self._normalize_ledger_record(record)
+            if normalized is None:
+                raise ValueError("Invalid tracker ledger record")
+            self._pending_ledger_records.append(normalized)
+        self._flush_ledger_records()
+
+    def _set_ledger_status(self, status, app_name, reason, now=None):
+        current = (self.ledger_status, self.ledger_app)
+        new = (status, app_name)
+        if current == new:
+            self.ledger_reason = reason
+            return
+
+        now = time.time() if now is None else now
+        now_monotonic = time.monotonic()
+        now_continuous = _read_continuous_time()
+        if status == "sleeping" and now_continuous is None:
+            reason += "; suspend-aware clock unavailable, using wall time"
+            self.ledger_clock_warning = True
+        records = []
+        if (
+            self.ledger_status is not None
+            and self.ledger_started_ts is not None
+            and self.ledger_started_monotonic is not None
+        ):
+            if self.ledger_status == "sleeping":
+                if (
+                    now_continuous is not None
+                    and self.ledger_started_continuous is not None
+                ):
+                    elapsed = max(
+                        0.0,
+                        now_continuous - self.ledger_started_continuous,
+                    )
+                else:
+                    elapsed = max(0.0, now - self.ledger_started_ts)
+                    self.ledger_clock_warning = True
+            else:
+                elapsed = max(
+                    0.0, now_monotonic - self.ledger_started_monotonic
+                )
+            records.extend(
+                self._duration_records(
+                    self.ledger_started_ts,
+                    now,
+                    self.ledger_status,
+                    self.ledger_app,
+                    self.ledger_reason,
+                    elapsed,
+                )
+            )
+        records.append(
+            {
+                "type": "status",
+                "timestamp": self._iso_timestamp(now),
+                "date": date.fromtimestamp(now).isoformat(),
+                "status": status,
+                "app": app_name,
+                "reason": reason,
+            }
+        )
+        self.ledger_status = status
+        self.ledger_app = app_name
+        self.ledger_reason = reason
+        self.ledger_started_ts = now
+        self.ledger_started_monotonic = now_monotonic
+        self.ledger_started_continuous = now_continuous
+        self._queue_ledger_records(records)
+
+    def _checkpoint_ledger(self, now=None):
+        if (
+            self.ledger_status is None
+            or self.ledger_started_ts is None
+            or self.ledger_started_monotonic is None
+        ):
+            return
+        now = time.time() if now is None else now
+        now_monotonic = time.monotonic()
+        now_continuous = _read_continuous_time()
+        if self.ledger_status == "sleeping":
+            if (
+                now_continuous is not None
+                and self.ledger_started_continuous is not None
+            ):
+                elapsed = max(
+                    0.0,
+                    now_continuous - self.ledger_started_continuous,
+                )
+            else:
+                elapsed = max(0.0, now - self.ledger_started_ts)
+                self.ledger_clock_warning = True
+        else:
+            elapsed = max(
+                0.0, now_monotonic - self.ledger_started_monotonic
+            )
+        records = self._duration_records(
+            self.ledger_started_ts,
+            now,
+            self.ledger_status,
+            self.ledger_app,
+            self.ledger_reason,
+            elapsed,
+        )
+        self.ledger_started_ts = now
+        self.ledger_started_monotonic = now_monotonic
+        self.ledger_started_continuous = now_continuous
+        self._queue_ledger_records(records)
 
     # ---- core loop ---------------------------------------------------
 
@@ -289,18 +692,38 @@ class SlackCheckTracker(rumps.App):
             display_name = app_name or "No frontmost app"
             self.work_status = f"{display_name} is not counted"
             self._pause_work_session(refresh=False)
+            self._set_ledger_status(
+                "excluded" if app_name else "no_app",
+                app_name,
+                self.work_status,
+            )
             return
 
         idle_seconds = self._input_idle_seconds()
         if idle_seconds is None:
             self.work_status = "keyboard/mouse activity unavailable"
             self._pause_work_session(refresh=False)
+            self._set_ledger_status(
+                "input_unavailable",
+                self.work_app_label,
+                self.work_status,
+            )
         elif idle_seconds >= INPUT_IDLE_THRESHOLD:
             self.work_status = f"idle for {self._humanize(idle_seconds)}"
             self._pause_work_session(refresh=False)
+            self._set_ledger_status(
+                "idle",
+                self.work_app_label,
+                self.work_status,
+            )
         else:
             self.work_status = f"counting {self.work_app_label}"
             self._start_work_tracking()
+            self._set_ledger_status(
+                "working",
+                self.work_app_label,
+                "recent keyboard/mouse input",
+            )
 
     def _roll_day_if_needed(self):
         now_day = _today_str()
@@ -341,11 +764,12 @@ class SlackCheckTracker(rumps.App):
         self._sync_work_tracking(frontmost_bundle, frontmost_name)
         now_monotonic = time.monotonic()
         if (
-            self.work_started_monotonic is not None
-            and now_monotonic - self._last_state_save_monotonic
+            now_monotonic - self._last_state_save_monotonic
             >= STATE_SAVE_INTERVAL
         ):
-            self._save_state()
+            if self.work_started_monotonic is not None:
+                self._save_state()
+            self._checkpoint_ledger()
             self._last_state_save_monotonic = now_monotonic
 
         self._refresh_title()
@@ -400,6 +824,11 @@ class SlackCheckTracker(rumps.App):
             )
         if self.state_save_error:
             self.work_detail_item.title += " · state save failed; retrying"
+        self.ledger_item.title = "Ledger: ~/.slack_check_tracker_ledger.sqlite3"
+        if self.ledger_save_error:
+            self.ledger_item.title += " · write pending"
+        if self.ledger_clock_warning:
+            self.ledger_item.title += " · sleep timing used wall-clock fallback"
 
     # ---- menu actions ------------------------------------------------
 
@@ -428,11 +857,24 @@ class SlackCheckTracker(rumps.App):
     def _handle_sleep(self):
         self.work_status = "Mac is sleeping"
         self._pause_work_session()
+        self._set_ledger_status("sleeping", None, self.work_status)
+
+    def _handle_wake(self):
+        self._cached_input_idle_seconds = None
+        self._last_input_probe_monotonic = None
+        frontmost_bundle, frontmost_name = self._frontmost_app_info()
+        self._sync_work_tracking(frontmost_bundle, frontmost_name)
+        self._refresh_title()
+
+    def _handle_quit(self):
+        self.work_status = "Tracker stopped"
+        self._pause_work_session()
+        self._set_ledger_status("stopped", None, self.work_status)
 
     def _handle_sigterm(self, _signum, _frame):
         # The setup scripts stop older copies with SIGTERM. Checkpoint first so
         # relaunching later cannot count the stopped interval as seated work.
-        self._pause_work_session()
+        self._handle_quit()
         rumps.quit_application()
 
     def reset_count(self, _sender):
@@ -441,7 +883,7 @@ class SlackCheckTracker(rumps.App):
         self._refresh_title()
 
     def quit_app(self, _sender):
-        self._pause_work_session()
+        self._handle_quit()
         rumps.quit_application()
 
 

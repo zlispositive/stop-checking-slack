@@ -24,6 +24,46 @@ The timer reads macOS's local `IOHIDSystem` idle time and the frontmost app.
 It does not capture keystrokes, mouse positions, window contents, or network
 data, and it does not require Accessibility permission.
 
+## Status ledger
+
+The app keeps a transactional local SQLite ledger at:
+
+```text
+~/.slack_check_tracker_ledger.sqlite3
+```
+
+The `ledger` table records:
+
+- `status` entries immediately when you switch between working, excluded apps,
+  idle, sleep, unavailable input, or tracker shutdown;
+- `duration` entries with the local date, start/end timestamps, app, status,
+  reason, and elapsed seconds.
+
+Open durations are checkpointed every minute while the Mac is awake and split
+at local midnight. SQLite transactions prevent partial records, and failed
+writes are saved to an atomic pending spool and retried with idempotent record
+IDs. Duration totals use monotonic clocks, so manual clock changes do not alter
+elapsed time. If the wall clock changes, `started_at`/`ended_at` retain the
+accounting timeline while `observed_started_at`/`observed_ended_at` preserve
+the actual wall-clock readings and `clock_adjustment_seconds` records the jump.
+
+Daily totals can be calculated by summing `duration_seconds` by `date`,
+`status`, and `app`:
+
+```bash
+sqlite3 ~/.slack_check_tracker_ledger.sqlite3 \
+  "SELECT date, status, COALESCE(app, ''), ROUND(SUM(duration_seconds)/60, 1)
+   FROM ledger
+   WHERE type = 'duration'
+   GROUP BY date, status, app
+   ORDER BY date DESC, status, app;"
+```
+
+Status values are `working`, `excluded`, `idle`, `input_unavailable`,
+`no_app`, `sleeping`, and `stopped`. A sleeping interval closes on wake; if
+power is lost during sleep, its transition remains recorded but that open
+duration may not close.
+
 Both trackers share one compact menu-bar item. This uses less space and
 prevents one tracker from being hidden while the other remains.
 
@@ -101,5 +141,6 @@ Open `slack_check_tracker.py` and edit near the top:
 - `INPUT_IDLE_THRESHOLD` — how long to keep counting without keyboard or mouse
   input (default 60s).
 - `WORK_APP_BUNDLE_IDS` — apps whose frontmost time can count as work.
+- `LEDGER_PATH` — local append-only status history.
 - The compact combined menu bar format lives in `_refresh_title()` if you want
   a different look.

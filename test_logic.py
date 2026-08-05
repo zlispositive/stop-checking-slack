@@ -65,6 +65,7 @@ rumps.quit_application = lambda: None
 rumps.events = types.SimpleNamespace(
     before_start=_EventEmitter(),
     on_sleep=_EventEmitter(),
+    on_wake=_EventEmitter(),
     before_quit=_EventEmitter(),
 )
 sys.modules["rumps"] = rumps
@@ -126,19 +127,35 @@ def set_front(app):
 
 def reset_state():
     """Start a scenario from a clean slate (no persisted state on disk)."""
-    try:
-        os.remove(_state_file)
-    except FileNotFoundError:
-        pass
+    for path in (
+        _state_file,
+        _ledger_file,
+        _ledger_file + "-wal",
+        _ledger_file + "-shm",
+        _ledger_spool_file,
+        _ledger_spool_file + ".tmp",
+        _lock_file,
+    ):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
 
 
 # ---- import the module under test (uses a temp state file) -----------
 _tmp = tempfile.mkdtemp()
 _state_file = os.path.join(_tmp, "state.json")
+_ledger_file = os.path.join(_tmp, "ledger.sqlite3")
+_ledger_spool_file = os.path.join(_tmp, "ledger.pending.json")
+_lock_file = os.path.join(_tmp, "tracker.lock")
 
 import slack_check_tracker as sct  # noqa: E402
 
 sct.STATE_PATH = _state_file
+sct.LEDGER_PATH = _ledger_file
+sct.LEDGER_SPOOL_PATH = _ledger_spool_file
+sct.INSTANCE_LOCK_PATH = _lock_file
+sct.ENABLE_INSTANCE_LOCK = False
 
 failures = []
 
@@ -147,6 +164,22 @@ def check(name, cond):
     print(("PASS " if cond else "FAIL ") + name)
     if not cond:
         failures.append(name)
+
+
+def read_ledger_records():
+    with sct.sqlite3.connect(_ledger_file) as connection:
+        connection.row_factory = sct.sqlite3.Row
+        rows = connection.execute(
+            """
+            SELECT record_id, type, date, timestamp, started_at, ended_at,
+                   status, app, reason, duration_seconds,
+                   observed_started_at, observed_ended_at,
+                   clock_adjustment_seconds
+            FROM ledger
+            ORDER BY rowid
+            """
+        )
+        return [dict(row) for row in rows]
 
 
 # --- Test 1: launching while a non-Slack app is frontmost, then switching in
@@ -346,6 +379,13 @@ try:
     check("activity probe failure pauses instead of overcounting",
           work_app.work_started_monotonic is None
           and "activity unavailable" in work_app.work_detail_item.title)
+    check("activity probe failure is ledgered",
+          work_app.ledger_status == "input_unavailable")
+
+    set_front(None)
+    work_app.tick(None)
+    check("missing frontmost app is ledgered",
+          work_app.ledger_status == "no_app")
 
     work_app.reset_work_session(None)
     check("reset clears accumulated automatic work time",
@@ -395,18 +435,32 @@ finally:
     sct.time.monotonic = real_monotonic
     sct._read_input_idle_seconds = real_idle_reader
 
-# --- Test 12: rumps lifecycle events configure placement and pause on sleep
+# --- Test 12: rumps lifecycle events configure placement and sleep/wake state
 reset_state()
 set_front("vscode")
 real_time = sct.time.time
 real_monotonic = sct.time.monotonic
 real_idle_reader = sct._read_input_idle_seconds
-clock = [3000.0]
-sct.time.time = lambda: clock[0]
-sct.time.monotonic = lambda: clock[0]
-sct._read_input_idle_seconds = lambda: 0
+real_continuous_reader = sct._read_continuous_time
+wall_clock = [3000.0]
+monotonic_clock = [3000.0]
+continuous_clock = [3000.0]
+idle = [0.0]
+idle_probe_calls = []
+sct.time.time = lambda: wall_clock[0]
+sct.time.monotonic = lambda: monotonic_clock[0]
+sct._read_continuous_time = lambda: continuous_clock[0]
+
+
+def lifecycle_idle_reader():
+    idle_probe_calls.append(True)
+    return idle[0]
+
+
+sct._read_input_idle_seconds = lifecycle_idle_reader
 lifecycle_app = sct.SlackCheckTracker()
-clock[0] += 45
+wall_clock[0] += 45
+monotonic_clock[0] += 45
 lifecycle_status_item = None
 previous_sigterm_handler = sct.signal.getsignal(sct.signal.SIGTERM)
 
@@ -416,6 +470,7 @@ def run_hook(app):
     check("run registers all native lifecycle callbacks",
           len(rumps.events.before_start.callbacks) == 1
           and len(rumps.events.on_sleep.callbacks) == 1
+          and len(rumps.events.on_wake.callbacks) == 1
           and len(rumps.events.before_quit.callbacks) == 1)
     check("run installs SIGTERM checkpoint handler",
           sct.signal.getsignal(sct.signal.SIGTERM)
@@ -431,6 +486,11 @@ def run_hook(app):
     app._nsapp = types.SimpleNamespace(nsstatusitem=lifecycle_status_item)
     rumps.events.before_start.emit()
     rumps.events.on_sleep.emit()
+    wall_clock[0] += 300
+    continuous_clock[0] += 600
+    idle[0] = 600
+    rumps.events.on_wake.emit()
+    rumps.events.before_quit.emit()
 
 
 _RUN_HOOK = run_hook
@@ -441,21 +501,68 @@ finally:
     sct.time.time = real_time
     sct.time.monotonic = real_monotonic
     sct._read_input_idle_seconds = real_idle_reader
+    sct._read_continuous_time = real_continuous_reader
 
 check("sleep event pauses and persists automatic work",
       lifecycle_app.work_started_monotonic is None
       and lifecycle_app.work_elapsed_seconds == 45
       and json.load(open(_state_file))["work_started_ts"] is None)
+check("sleep, wake, and shutdown transitions are ledgered",
+      [record["status"] for record in read_ledger_records()
+       if record["type"] == "status"][-3:]
+      == ["sleeping", "idle", "stopped"])
+check("sleep duration uses continuous time across a wall-clock adjustment",
+      [record["duration_seconds"] for record in read_ledger_records()
+       if record["type"] == "duration"
+       and record["status"] == "sleeping"] == [600.0])
+check("wake forces a fresh activity probe before resuming work",
+      len(idle_probe_calls) == 2
+      and lifecycle_app.work_elapsed_seconds == 45)
 check("before-start event sets placement autosave name",
       lifecycle_status_item.autosave_name == sct.STATUS_ITEM_AUTOSAVE_NAME)
 check("run unregisters all native lifecycle callbacks",
       not rumps.events.before_start.callbacks
       and not rumps.events.on_sleep.callbacks
+      and not rumps.events.on_wake.callbacks
       and not rumps.events.before_quit.callbacks)
 check("run restores previous SIGTERM handler",
       sct.signal.getsignal(sct.signal.SIGTERM) == previous_sigterm_handler)
 
-# --- Test 13: SIGTERM checkpoints automatic work before termination
+# --- Test 13: sleep timing fallback is explicit when continuous time fails
+reset_state()
+set_front("vscode")
+real_time = sct.time.time
+real_monotonic = sct.time.monotonic
+real_idle_reader = sct._read_input_idle_seconds
+real_continuous_reader = sct._read_continuous_time
+clock = [3500.0]
+sct.time.time = lambda: clock[0]
+sct.time.monotonic = lambda: clock[0]
+sct._read_input_idle_seconds = lambda: 0
+sct._read_continuous_time = lambda: None
+try:
+    fallback_app = sct.SlackCheckTracker()
+    clock[0] += 10
+    fallback_app._handle_sleep()
+    clock[0] += 20
+    fallback_app._handle_wake()
+    fallback_sleep_records = [
+        record for record in read_ledger_records()
+        if record["type"] == "duration"
+        and record["status"] == "sleeping"
+    ]
+    check("sleep fallback uses wall time and surfaces a warning",
+          fallback_sleep_records[-1]["duration_seconds"] == 20
+          and "suspend-aware clock unavailable"
+          in fallback_sleep_records[-1]["reason"]
+          and "wall-clock fallback" in fallback_app.ledger_item.title)
+finally:
+    sct.time.time = real_time
+    sct.time.monotonic = real_monotonic
+    sct._read_input_idle_seconds = real_idle_reader
+    sct._read_continuous_time = real_continuous_reader
+
+# --- Test 14: SIGTERM checkpoints automatic work before termination
 reset_state()
 set_front("cmux")
 real_time = sct.time.time
@@ -482,7 +589,7 @@ finally:
     sct._read_input_idle_seconds = real_idle_reader
     rumps.quit_application = real_quit
 
-# --- Test 14: wall-clock changes do not alter automatic elapsed time
+# --- Test 15: wall-clock changes do not alter automatic elapsed time
 reset_state()
 set_front("vscode")
 real_time = sct.time.time
@@ -502,12 +609,206 @@ try:
     rollback_app._pause_work_session()
     check("wall-clock rollback checkpoints monotonic time",
           rollback_app.work_elapsed_seconds == 30)
+    set_front("chrome")
+    rollback_app.tick(None)
+    rollback_durations = [
+        record for record in read_ledger_records()
+        if record["type"] == "duration"
+        and record["status"] == "working"
+    ]
+    check("ledger duration uses monotonic time across clock rollback",
+          rollback_durations[-1]["duration_seconds"] == 30)
+    check("ledger preserves observed wall-clock endpoints across rollback",
+          rollback_durations[-1]["observed_started_at"]
+          == rollback_app._iso_timestamp(500)
+          and rollback_durations[-1]["observed_ended_at"]
+          == rollback_app._iso_timestamp(400)
+          and rollback_durations[-1]["ended_at"]
+          == rollback_app._iso_timestamp(530)
+          and rollback_durations[-1]["clock_adjustment_seconds"] == -130)
 finally:
     sct.time.time = real_time
     sct.time.monotonic = real_monotonic
     sct._read_input_idle_seconds = real_idle_reader
 
-# --- Test 15: native status item gets a stable autosave name
+# --- Test 16: ledger records transitions and daily durations
+reset_state()
+set_front("chrome")
+real_time = sct.time.time
+real_monotonic = sct.time.monotonic
+real_idle_reader = sct._read_input_idle_seconds
+real_connect = sct.sqlite3.connect
+clock = [1000.0]
+idle = [0.0]
+sct.time.time = lambda: clock[0]
+sct.time.monotonic = lambda: clock[0]
+sct._read_input_idle_seconds = lambda: idle[0]
+try:
+    ledger_app = sct.SlackCheckTracker()
+    clock[0] += 10
+    set_front("vscode")
+    ledger_app.tick(None)
+    clock[0] += 20
+    set_front("cmux")
+    ledger_app.tick(None)
+    clock[0] += 30
+    idle[0] = 61
+    ledger_app.tick(None)
+    clock[0] += 15
+    ledger_app._checkpoint_ledger()
+
+    ledger_records = read_ledger_records()
+    status_records = [
+        record for record in ledger_records if record["type"] == "status"
+    ]
+    duration_records = [
+        record for record in ledger_records if record["type"] == "duration"
+    ]
+    check("ledger records timestamped status transitions",
+          [(record["status"], record["app"]) for record in status_records]
+          == [
+              ("excluded", "Google Chrome"),
+              ("working", "VS Code"),
+              ("working", "cmux"),
+              ("idle", "cmux"),
+          ])
+    check("ledger records per-status durations",
+          [(record["status"], record["duration_seconds"])
+           for record in duration_records]
+          == [
+              ("excluded", 10.0),
+              ("working", 20.0),
+              ("working", 30.0),
+              ("idle", 15.0),
+          ])
+    check("duration records are tagged for daily totals",
+          all(record["date"] and record["started_at"] and record["ended_at"]
+              for record in duration_records))
+
+    midnight_start = sct.datetime(2026, 8, 4, 23, 59, 50).timestamp()
+    split_records = ledger_app._duration_records(
+        midnight_start,
+        midnight_start + 20,
+        "working",
+        "VS Code",
+        "test",
+    )
+    check("ledger splits durations across local midnight",
+          [record["duration_seconds"] for record in split_records] == [10.0, 10.0]
+          and [record["date"] for record in split_records]
+          == ["2026-08-04", "2026-08-05"])
+    jump_start = midnight_start + 5
+    adjusted_split_records = ledger_app._duration_records(
+        jump_start,
+        jump_start + 3610,
+        "working",
+        "VS Code",
+        "clock adjusted",
+        elapsed_seconds=10,
+    )
+    check("forward jump allocates time on the monotonic accounting timeline",
+          [record["duration_seconds"] for record in adjusted_split_records]
+          == [5.0, 5.0]
+          and [record["date"] for record in adjusted_split_records]
+          == ["2026-08-04", "2026-08-05"]
+          and adjusted_split_records[-1]["observed_ended_at"]
+          == ledger_app._iso_timestamp(jump_start + 3610)
+          and adjusted_split_records[-1]["clock_adjustment_seconds"] == 3600)
+
+    def fail_ledger_connect(*_args, **_kwargs):
+        raise sct.sqlite3.OperationalError("database unavailable")
+
+    sct.sqlite3.connect = fail_ledger_connect
+    with redirect_stderr(io.StringIO()) as ledger_error:
+        ledger_app._set_ledger_status(
+            "excluded", "Safari", "Safari is not counted"
+        )
+    pending_records = list(ledger_app._pending_ledger_records)
+    check("ledger failure is durably spooled and visible",
+          ledger_app.ledger_save_error
+          and pending_records
+          and os.path.exists(_ledger_spool_file)
+          and "Could not update tracker ledger" in ledger_error.getvalue())
+    sct.sqlite3.connect = real_connect
+    ledger_app._flush_ledger_records()
+    check("queued ledger records flush after recovery",
+          not ledger_app.ledger_save_error
+          and not ledger_app._pending_ledger_records
+          and not os.path.exists(_ledger_spool_file))
+
+    records_after_recovery = read_ledger_records()
+    legacy_pending_records = [
+        {
+            key: value for key, value in record.items()
+            if key not in {
+                "observed_started_at",
+                "observed_ended_at",
+                "clock_adjustment_seconds",
+            }
+        }
+        for record in pending_records
+    ]
+    with open(_ledger_spool_file, "w") as spool:
+        json.dump(legacy_pending_records, spool)
+    ledger_app._load_ledger_spool()
+    check("replaying a legacy stale spool is normalized and idempotent",
+          len(read_ledger_records()) == len(records_after_recovery)
+          and not ledger_app._pending_ledger_records)
+finally:
+    sct.sqlite3.connect = real_connect
+    sct.time.time = real_time
+    sct.time.monotonic = real_monotonic
+    sct._read_input_idle_seconds = real_idle_reader
+
+# --- Test 17: excluded statuses are checkpointed without a transition
+reset_state()
+set_front("chrome")
+real_time = sct.time.time
+real_monotonic = sct.time.monotonic
+clock = [5000.0]
+sct.time.time = lambda: clock[0]
+sct.time.monotonic = lambda: clock[0]
+try:
+    checkpoint_app = sct.SlackCheckTracker()
+    clock[0] += sct.STATE_SAVE_INTERVAL
+    checkpoint_app.tick(None)
+    checkpoint_records = read_ledger_records()
+    check("excluded status receives periodic duration checkpoints",
+          any(record["type"] == "duration"
+              and record["status"] == "excluded"
+              and record["duration_seconds"] == sct.STATE_SAVE_INTERVAL
+              for record in checkpoint_records))
+finally:
+    sct.time.time = real_time
+    sct.time.monotonic = real_monotonic
+
+# --- Test 18: only one tracker instance can own the ledger spool
+reset_state()
+sct.ENABLE_INSTANCE_LOCK = True
+sct.INSTANCE_LOCK_WAIT_SECONDS = 0
+set_front("chrome")
+lock_owner = sct.SlackCheckTracker()
+with redirect_stderr(io.StringIO()) as lock_error:
+    try:
+        sct.SlackCheckTracker()
+    except SystemExit as error:
+        duplicate_exit_code = error.code
+    else:
+        duplicate_exit_code = None
+check("instance lock rejects a duplicate tracker",
+      duplicate_exit_code == 0
+      and "already running" in lock_error.getvalue())
+lock_owner._instance_lock.close()
+lock_owner._instance_lock = None
+replacement_owner = sct.SlackCheckTracker()
+check("instance lock is released when the owner exits",
+      replacement_owner._instance_lock is not None)
+replacement_owner._instance_lock.close()
+replacement_owner._instance_lock = None
+sct.ENABLE_INSTANCE_LOCK = False
+sct.INSTANCE_LOCK_WAIT_SECONDS = 5
+
+# --- Test 19: native status item gets a stable autosave name
 class _FakeStatusItem:
     autosave_name = None
 
