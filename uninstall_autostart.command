@@ -1,5 +1,5 @@
 #!/bin/bash
-# Double-click to stop Slack Check Tracker from starting at login and quit it now.
+# Double-click to stop the Slack + Work Tracker at login and quit it now.
 
 set -e
 cd "$(dirname "$0")"

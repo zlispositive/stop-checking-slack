@@ -1,5 +1,5 @@
 #!/bin/bash
-# Double-click this file in Finder to set up and launch Slack Check Tracker.
+# Double-click this file in Finder to set up and launch the Slack + Work Tracker.
 # It creates a self-contained virtualenv next to this script, installs the two
 # dependencies into it (once), and starts the menu bar app.
 #
@@ -24,8 +24,8 @@ echo "==> Installing dependencies (rumps, pyobjc-framework-Cocoa)..."
 "$VENV/bin/pip" install --upgrade pip >/dev/null
 "$VENV/bin/pip" install -r requirements.txt
 
-echo "==> Launching Slack Check Tracker..."
-echo "    Look for the 💬 icon in your menu bar (top-right of the screen)."
-echo "    You can close this Terminal window once the icon appears."
+echo "==> Launching Slack + Work Session Tracker..."
+echo "    Look for the combined 🪑/💬 item in your menu bar."
+echo "    You can close this Terminal window once the item appears."
 
 exec "$VENV/bin/python" slack_check_tracker.py

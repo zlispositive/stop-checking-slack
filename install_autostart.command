@@ -1,5 +1,5 @@
 #!/bin/bash
-# Double-click to make Slack Check Tracker start automatically at login.
+# Double-click to make the Slack + Work Tracker start automatically at login.
 #
 # Installs a per-user LaunchAgent that runs the app from this project's
 # virtualenv. It starts at login, and relaunches if it ever crashes — but
@@ -67,6 +67,6 @@ launchctl bootstrap "gui/$UID_NUM" "$PLIST"
 launchctl enable "gui/$UID_NUM/$LABEL"
 launchctl kickstart "gui/$UID_NUM/$LABEL"
 
-echo "==> Done. 💬 should be in your menu bar, and it will start at every login."
+echo "==> Done. The 🪑/💬 item should be in your menu bar and start at every login."
 echo "    Log: $LOG"
 echo "    To undo: run uninstall_autostart.command"
